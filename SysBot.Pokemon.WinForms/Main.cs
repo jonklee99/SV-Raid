@@ -4,7 +4,6 @@ using SysBot.Pokemon.SV.BotRaid.Helpers;
 using System;
 using System.Collections.Generic;
 using System.Drawing;
-using System.Drawing.Drawing2D;
 using System.IO;
 using System.Linq;
 using System.Net.Sockets;
@@ -13,43 +12,30 @@ using System.Text.Json.Serialization;
 using System.Threading;
 using System.Threading.Tasks;
 using System.Windows.Forms;
-using System.ComponentModel;
+using System.Net;
+using System.Text;
 
 namespace SysBot.Pokemon.WinForms
 {
     public sealed partial class Main : Form
     {
         private readonly List<PokeBotState> Bots = new();
-        [DesignerSerializationVisibility(DesignerSerializationVisibility.Hidden)]
-        internal ProgramConfig Config { get; set; }
+        private ProgramConfig Config { get; set; } // make it a property with private setter
         private IPokeBotRunner RunningEnvironment { get; set; }
+
         public readonly ISwitchConnectionAsync? SwitchConnection;
-        [DesignerSerializationVisibility(DesignerSerializationVisibility.Hidden)]
         public static bool IsUpdating { get; set; } = false;
         private System.Windows.Forms.Timer _autoSaveTimer;
-        private System.Windows.Forms.Timer _updateCheckTimer;
         private TcpListener? _tcpListener;
         private CancellationTokenSource? _cts;
-        private bool hasUpdate = false;
-        private double pulsePhase = 0;
-        private Color lastIndicatorColor = Color.Empty;
-        private DateTime lastIndicatorUpdate = DateTime.MinValue;
-        private const int PULSE_UPDATE_INTERVAL_MS = 50; 
 
         public Main()
         {
             InitializeComponent();
             Load += async (sender, e) => await InitializeAsync();
 
-            // Initialize dummy controls for compatibility
-            TC_Main = new TabControl { Visible = false };
-            Tab_Bots = new TabPage();
-            Tab_Hub = new TabPage();
-            Tab_Logs = new TabPage();
-            TC_Main.TabPages.AddRange(new[] { Tab_Bots, Tab_Hub, Tab_Logs });
-            comboBox1 = new ComboBox { Visible = false };
-            TC_Main.SendToBack();
-            comboBox1.SendToBack();
+            TC_Main.SelectedIndexChanged += TC_Main_SelectedIndexChanged;
+            RTB_Logs.TextChanged += RTB_Logs_TextChanged;
         }
 
         private async Task InitializeAsync()
@@ -58,44 +44,14 @@ namespace SysBot.Pokemon.WinForms
                 return;
             string discordName = string.Empty;
 
-            // Update checker - check silently on startup
-            try
-            {
-                var (updateAvailable, _, _) = await UpdateChecker.CheckForUpdatesAsync(forceShow: false);
-                hasUpdate = updateAvailable;
-            }
-            catch { /* Ignore update check errors on startup */ }
+            // Update checker
+            UpdateChecker updateChecker = new();
+            await UpdateChecker.CheckForUpdatesAsync();
 
             if (File.Exists(Program.ConfigPath))
             {
-                try
-                {
-                    var lines = File.ReadAllText(Program.ConfigPath);
-                    Config = JsonSerializer.Deserialize(lines, ProgramConfigContext.Default.ProgramConfig) ?? new ProgramConfig();
-                }
-                catch (Exception ex)
-                {
-                    LogUtil.LogError($"Config corrupted, trying backup: {ex.Message}", "Config");
-
-                    // Try to load from most recent backup
-                    var backupFiles = Directory.GetFiles(Path.GetDirectoryName(Program.ConfigPath), "*.backup_*")
-                        .OrderByDescending(f => new FileInfo(f).LastWriteTime)
-                        .FirstOrDefault();
-
-                    if (backupFiles != null && File.Exists(backupFiles))
-                    {
-                        var backupLines = File.ReadAllText(backupFiles);
-                        Config = JsonSerializer.Deserialize(backupLines, ProgramConfigContext.Default.ProgramConfig) ?? new ProgramConfig();
-                        File.WriteAllText(Program.ConfigPath, backupLines); // Restore backup
-                        LogUtil.LogInfo($"Restored config from backup", "Config");
-                    }
-                    else
-                    {
-                        Config = new ProgramConfig();
-                        LogUtil.LogError("No valid backup found, using new config", "Config");
-                    }
-                }
-
+                var lines = File.ReadAllText(Program.ConfigPath);
+                Config = JsonSerializer.Deserialize(lines, ProgramConfigContext.Default.ProgramConfig) ?? new ProgramConfig();
                 LogConfig.MaxArchiveFiles = Config.Hub.MaxArchiveFiles;
                 LogConfig.LoggingEnabled = Config.Hub.LoggingEnabled;
 
@@ -113,25 +69,20 @@ namespace SysBot.Pokemon.WinForms
             }
 
             LoadControls();
-            Text = $"{(string.IsNullOrEmpty(Config.Hub.BotName) ? "S/V RaidBot" : Config.Hub.BotName)} {SVRaidBot.Version} ({Config.Mode})";
-            trayIcon.Text = (Config?.Hub?.BotName != null && !string.IsNullOrEmpty(Config.Hub.BotName)) ? Config.Hub.BotName : "S/V RaidBot";
-            _ = Task.Run(BotMonitor);
+            Text = $"{(string.IsNullOrEmpty(Config.Hub.BotName) ? "NotPaldea.net" : Config.Hub.BotName)} {SVRaidBot.Version} ({Config.Mode})";
+            Task.Run(BotMonitor);
             InitUtil.InitializeStubs(Config.Mode);
-            // Start periodic update checks
-            StartUpdateCheckTimer();
+            StartTcpListener();
 
             LogUtil.LogInfo($"Bot initialization complete", "System");
-            _ = Task.Run(() =>
+        }
+
+        private void TC_Main_SelectedIndexChanged(object sender, EventArgs e)
+        {
+            if (TC_Main.SelectedTab == Tab_Logs)
             {
-                try
-                {
-                    this.InitWebServer();
-                }
-                catch (Exception ex)
-                {
-                    LogUtil.LogError($"Failed to initialize web server: {ex.Message}", "System");
-                }
-            });
+                RTB_Logs.Refresh();
+            }
         }
 
         private void RTB_Logs_TextChanged(object sender, EventArgs e)
@@ -165,6 +116,310 @@ namespace SysBot.Pokemon.WinForms
             }
         }
 
+        private void StartTcpListener(int preferredPort = 0)
+        {
+            if (_tcpListener != null) return;
+            int basePort = 55000;
+            int portRange = 5000;
+
+            int initialPort = preferredPort > 0
+                ? preferredPort
+                : basePort + (Environment.ProcessId % portRange);
+
+            const int maxAttempts = 10;
+            int currentAttempt = 0;
+            int portToUse = initialPort;
+            bool success = false;
+
+            while (!success && currentAttempt < maxAttempts)
+            {
+                try
+                {
+                    currentAttempt++;
+                    if (currentAttempt > 1)
+                    {
+                        int randomOffset = (Environment.ProcessId + Environment.TickCount) % portRange;
+                        portToUse = basePort + ((initialPort + randomOffset * currentAttempt) % portRange);
+                        LogUtil.LogInfo($"TCP port conflict detected. Trying alternate port {portToUse} (attempt {currentAttempt}/{maxAttempts})", "TCP");
+                    }
+                    _cts = new CancellationTokenSource();
+                    _tcpListener = new TcpListener(IPAddress.Loopback, portToUse);
+                    _tcpListener.Start();
+                    success = true;
+                    LogUtil.LogInfo($"TCP Listener started on port {portToUse}", "TCP");
+                    string portInfoPath = Path.Combine(Path.GetDirectoryName(Application.ExecutablePath), $"SVRaidBot_{Environment.ProcessId}.port");
+                    File.WriteAllText(portInfoPath, portToUse.ToString());
+                    Task.Run(() => AcceptLoop(_cts.Token));
+                }
+                catch (Exception ex)
+                {
+                    if (currentAttempt >= maxAttempts)
+                    {
+                        LogUtil.LogError($"All attempts to start TCP listener failed. Last attempt on port {portToUse}: {ex.Message}", "TCP");
+
+                        try
+                        {
+                            string portInfoPath = Path.Combine(Path.GetDirectoryName(Application.ExecutablePath), $"SVRaidBot_{Environment.ProcessId}.port");
+                            File.WriteAllText(portInfoPath, "ERROR:" + ex.Message);
+                        }
+                        catch { }
+                    }
+                    else
+                    {
+                        LogUtil.LogError($"Failed to start TCP listener on port {portToUse}: {ex.Message}. Will try another port.", "TCP");
+
+                        // Clean up before retry
+                        _tcpListener = null;
+                        _cts?.Dispose();
+                        _cts = null;
+                    }
+                }
+            }
+        }
+
+        private async Task AcceptLoop(CancellationToken ct)
+        {
+            while (!ct.IsCancellationRequested && _tcpListener != null)
+            {
+                try
+                {
+                    var client = await _tcpListener.AcceptTcpClientAsync();
+                    if (client != null)
+                        _ = Task.Run(() => HandleClient(client, ct));
+                }
+                catch (ObjectDisposedException)
+                {
+                    break;
+                }
+                catch (Exception ex)
+                {
+                    LogUtil.LogError($"AcceptLoop error: {ex.Message}", "TCP");
+                    await Task.Delay(500);
+                }
+            }
+        }
+
+        private async Task HandleClient(TcpClient client, CancellationToken ct)
+        {
+            using (client)
+            {
+                try
+                {
+                    var stream = client.GetStream();
+                    using var reader = new StreamReader(stream, Encoding.UTF8);
+                    using var writer = new StreamWriter(stream, Encoding.UTF8) { AutoFlush = true };
+
+                    var commandLine = await reader.ReadLineAsync();
+                    if (string.IsNullOrEmpty(commandLine)) return;
+
+                    LogUtil.LogInfo($"Received command: {commandLine}", "TCP");
+                    string response = ExecuteBotCommand(commandLine.Trim());
+                    await writer.WriteLineAsync(response);
+                }
+                catch (Exception ex)
+                {
+                    LogUtil.LogError($"HandleClient error: {ex.Message}", "TCP");
+                }
+            }
+        }
+
+        private string ExecuteBotCommand(string cmd)
+        {
+            switch (cmd)
+            {
+                case "StopAll":
+                    RunningEnvironment.StopAll();
+                    return "STOPPED";
+
+                case "StartAll":
+                    // Reset error state when starting
+                    SysBot.Pokemon.SV.BotRaid.RotatingRaidBotSV.HasErrored = false;
+                    RunningEnvironment.InitializeStart();
+                    foreach (var c in FLP_Bots.Controls.OfType<BotController>())
+                        c.SendCommand(BotControlCommand.Start);
+                    return "STARTED";
+
+                case "IdleAll":
+                    foreach (var c in FLP_Bots.Controls.OfType<BotController>())
+                        c.SendCommand(BotControlCommand.Idle);
+                    return "IDLING";
+
+                case "ResumeAll":
+                    // Reset error state when resuming
+                    SysBot.Pokemon.SV.BotRaid.RotatingRaidBotSV.HasErrored = false;
+                    foreach (var c in FLP_Bots.Controls.OfType<BotController>())
+                        c.SendCommand(BotControlCommand.Resume);
+                    return "RESUMED";
+
+                case "RestartAll":
+                    // Reset error state when restarting
+                    SysBot.Pokemon.SV.BotRaid.RotatingRaidBotSV.HasErrored = false;
+                    foreach (var c in FLP_Bots.Controls.OfType<BotController>())
+                    {
+                        RunningEnvironment.InitializeStart();
+                        c.SendCommand(BotControlCommand.Restart);
+                    }
+                    return "RESTARTING";
+
+                case "RebootAll":
+                    // Reset error state when rebooting
+                    SysBot.Pokemon.SV.BotRaid.RotatingRaidBotSV.HasErrored = false;
+                    foreach (var c in FLP_Bots.Controls.OfType<BotController>())
+                        c.SendCommand(BotControlCommand.RebootAndStop);
+                    return "REBOOTING";
+
+                case "Status":
+                    // Check actual status of each bot's routine
+                    foreach (var c in FLP_Bots.Controls.OfType<BotController>())
+                    {
+                        try
+                        {
+                            var botState = c.ReadBotState();
+                            // If any bot is not idle, return its status
+                            if (botState != "IDLE")
+                            {
+                                return botState;
+                            }
+                        }
+                        catch
+                        {
+                            return "ERROR"; // Error reading state
+                        }
+                    }
+                    return "IDLE"; // All bots are idle
+
+                case "IsReady":
+                    // First check - are there any configured bots?
+                    if (FLP_Bots.Controls.OfType<BotController>().Count() == 0)
+                    {
+                        LogUtil.LogInfo("No bots are configured", "TCP");
+                        return "NOT_READY";
+                    }
+
+                    // Second check - static error flag
+                    try
+                    {
+                        if (SysBot.Pokemon.SV.BotRaid.RotatingRaidBotSV.HasErrored)
+                        {
+                            LogUtil.LogInfo("Static HasErrored flag is true", "TCP");
+                            return "NOT_READY";
+                        }
+                    }
+                    catch { /* Ignore if not available */ }
+
+                    // Third check - scan log records for recent errors
+                    // If any error message was logged in the last 10 minutes, consider the bot not ready
+                    // This ensures we detect post-crash scenarios even when IsRunning is false
+                    try
+                    {
+                        // Check the RTB_Logs text for recent error messages
+                        string logText = RTB_Logs.Text;
+                        if (!string.IsNullOrEmpty(logText))
+                        {
+                            // First check for the most definitive crash message
+                            if (logText.Contains("Bot has crashed"))
+                            {
+                                LogUtil.LogInfo("Found 'Bot has crashed' in logs", "TCP");
+                                return "NOT_READY";
+                            }
+
+                            // Then check for ending message
+                            if (logText.Contains("Ending RotatingRaidBotSV loop"))
+                            {
+                                LogUtil.LogInfo("Found 'Ending RotatingRaidBotSV loop' in logs", "TCP");
+                                return "NOT_READY";
+                            }
+
+                            // Check if there are connection errors in recent logs
+                            if (logText.Contains("Connection error"))
+                            {
+                                LogUtil.LogInfo("Found 'Connection error' in logs", "TCP");
+                                return "NOT_READY";
+                            }
+                        }
+                    }
+                    catch (Exception ex)
+                    {
+                        LogUtil.LogError($"Error checking logs: {ex.Message}", "TCP");
+                    }
+
+                    // Fourth check - inspect each bot's state
+                    foreach (var c in FLP_Bots.Controls.OfType<BotController>())
+                    {
+                        try
+                        {
+                            var botSource = c.GetBot();
+                            if (botSource == null)
+                            {
+                                LogUtil.LogInfo("Bot source is null", "TCP");
+                                return "NOT_READY";
+                            }
+
+                            // Check if the bot is in a known error state
+                            string state = c.ReadBotState();
+                            if (state == "ERROR" || state == "STOPPING")
+                            {
+                                LogUtil.LogInfo($"Bot state is {state}", "TCP");
+                                return "NOT_READY";
+                            }
+
+                            // Check for any connection issues
+                            try
+                            {
+                                if (botSource.Bot == null || botSource.Bot.Connection == null)
+                                {
+                                    LogUtil.LogInfo("Bot or Bot.Connection is null", "TCP");
+                                    return "NOT_READY";
+                                }
+
+                                if (!botSource.Bot.Connection.Connected)
+                                {
+                                    LogUtil.LogInfo("Bot is not connected", "TCP");
+                                    return "NOT_READY";
+                                }
+                            }
+                            catch
+                            {
+                                LogUtil.LogInfo("Exception checking connection status", "TCP");
+                                return "NOT_READY";
+                            }
+                        }
+                        catch (Exception ex)
+                        {
+                            LogUtil.LogInfo($"Exception while checking bot: {ex.Message}", "TCP");
+                            return "NOT_READY";
+                        }
+                    }
+
+                    return "READY"; // All checks passed, bot is ready
+
+                case "RefreshMap":
+                    foreach (var c in FLP_Bots.Controls.OfType<BotController>())
+                        c.SendCommand(BotControlCommand.RefreshMap, false);
+                    return "REFRESHED";
+
+                default:
+                    return $"Unknown command: {cmd}";
+            }
+        }
+
+        private void StopTcpListener()
+        {
+            try
+            {
+                // Delete port info file as an extra precaution
+                string portInfoPath = Path.Combine(Path.GetDirectoryName(Application.ExecutablePath), $"SVRaidBot_{Environment.ProcessId}.port");
+                if (File.Exists(portInfoPath))
+                    File.Delete(portInfoPath);
+
+                _cts?.Cancel();
+                _tcpListener?.Stop();
+                _cts = null;
+                _tcpListener = null;
+            }
+            catch { }
+        }
+
         private void LoadControls()
         {
             MinimumSize = Size;
@@ -188,6 +443,48 @@ namespace SysBot.Pokemon.WinForms
             CB_Protocol.ValueMember = nameof(ComboItem.Value);
             CB_Protocol.DataSource = listP;
             CB_Protocol.SelectedIndex = (int)SwitchProtocol.WiFi; // default option
+
+            comboBox1.Items.Add("Light Mode");
+            comboBox1.Items.Add("Dark Mode");
+            comboBox1.Items.Add("Poke Mode");
+            comboBox1.Items.Add("Gengar Mode");
+            comboBox1.Items.Add("Sylveon Mode");
+
+            string theme = Config.Hub.ThemeOption;
+            if (string.IsNullOrEmpty(theme) || !comboBox1.Items.Contains(theme))
+            {
+                comboBox1.SelectedIndex = 0;  // Set default selection to Light Mode if ThemeOption is empty or invalid
+            }
+            else
+            {
+                comboBox1.SelectedItem = theme;  // Set the selected item in the combo box based on ThemeOption
+                switch (theme)
+                {
+                    case "Dark Mode":
+                        ApplyDarkTheme();
+                        break;
+
+                    case "Light Mode":
+                        ApplyLightTheme();
+                        break;
+
+                    case "Poke Mode":
+                        ApplyPokemonTheme();
+                        break;
+
+                    case "Gengar Mode":
+                        ApplyGengarTheme();
+                        break;
+
+                    case "Sylveon Mode":
+                        ApplySylveonTheme();
+                        break;
+
+                    default:
+                        ApplyLightTheme();  // Default to Light Mode if no matching theme is found
+                        break;
+                }
+            }
 
             LogUtil.Forwarders.Add(AppendLog);
         }
@@ -227,18 +524,8 @@ namespace SysBot.Pokemon.WinForms
             {
                 return;
             }
-
-            // If not exiting, minimize to tray instead
-            if (!isExiting)
-            {
-                e.Cancel = true;
-                WindowState = FormWindowState.Minimized;
-                ShowInTaskbar = false;
-                trayIcon.Visible = true;
-                trayIcon.ShowBalloonTip(2000, "S/V RaidBot", "Application minimized to system tray", ToolTipIcon.Info);
-                return;
-            }
-            this.StopWebServer();
+            if (IsUpdating) return;
+            StopTcpListener();
 
             // Delete the port info file
             try
@@ -255,26 +542,6 @@ namespace SysBot.Pokemon.WinForms
                 _autoSaveTimer.Dispose();
             }
 
-            if (_updateCheckTimer != null)
-            {
-                _updateCheckTimer.Stop();
-                _updateCheckTimer.Dispose();
-            }
-
-            if (animationTimer != null)
-            {
-                animationTimer.Stop();
-                animationTimer.Dispose();
-            }
-            // Create a backup copy of config
-            try
-            {
-                if (File.Exists(Program.ConfigPath))
-                {
-                    File.Copy(Program.ConfigPath, Program.ConfigPath + ".backup", true);
-                }
-            }
-            catch { }
             SaveCurrentConfig();
             var bots = RunningEnvironment;
             if (!bots.IsRunning)
@@ -295,19 +562,10 @@ namespace SysBot.Pokemon.WinForms
 
         private void SaveCurrentConfig()
         {
-            try
-            {
-                var cfg = GetCurrentConfiguration();
-                var lines = JsonSerializer.Serialize(cfg, ProgramConfigContext.Default.ProgramConfig);
-
-                string tempPath = Program.ConfigPath + ".tmp";
-                File.WriteAllText(tempPath, lines);
-                File.Move(tempPath, Program.ConfigPath, true);
-            }
-            catch (Exception ex)
-            {
-                LogUtil.LogError($"Failed to save config: {ex.Message}", "Config");
-            }
+            var cfg = GetCurrentConfiguration();
+            // The ThemeOption property is part of the Config object, so it will be saved automatically
+            var lines = JsonSerializer.Serialize(cfg, ProgramConfigContext.Default.ProgramConfig);
+            File.WriteAllText(Program.ConfigPath, lines);
         }
 
         [JsonSerializable(typeof(ProgramConfig))]
@@ -325,7 +583,7 @@ namespace SysBot.Pokemon.WinForms
             LogUtil.LogInfo("Starting all bots...", "Form");
             RunningEnvironment.InitializeStart();
             SendAll(BotControlCommand.Start);
-            btnNavLogs.PerformClick(); // Switch to logs view
+            Tab_Logs.Select();
 
             if (Bots.Count == 0)
                 WinFormsUtil.Alert("No bots configured, but all supporting services have been started.");
@@ -341,7 +599,7 @@ namespace SysBot.Pokemon.WinForms
                 LogUtil.LogInfo("Restarting all the consoles...", "Form");
                 RunningEnvironment.InitializeStart();
                 SendAll(BotControlCommand.RebootAndStop);
-                Invoke((MethodInvoker)(() => btnNavLogs.PerformClick())); // Switch to logs view
+                Tab_Logs.Select();
                 if (Bots.Count == 0)
                     WinFormsUtil.Alert("No bots configured, but all supporting services have been issued the reboot command.");
             });
@@ -349,36 +607,37 @@ namespace SysBot.Pokemon.WinForms
 
         private async void Updater_Click(object sender, EventArgs e)
         {
-            var (updateAvailable, updateRequired, newVersion) = await UpdateChecker.CheckForUpdatesAsync(forceShow: true);
-            hasUpdate = updateAvailable; // Update the indicator
-        }
+            var (updateAvailable, updateRequired, newVersion) = await UpdateChecker.CheckForUpdatesAsync();
+            if (!updateAvailable)
+            {
+                var result = MessageBox.Show(
+                    "You are on the latest version. Would you like to re-download the current version?",
+                    "Update Check",
+                    MessageBoxButtons.YesNo,
+                    MessageBoxIcon.Question);
 
-        private void StartUpdateCheckTimer()
-        {
-            _updateCheckTimer = new System.Windows.Forms.Timer
-            {
-                Interval = 3600000, // Check every hour
-                Enabled = true
-            };
-            _updateCheckTimer.Tick += async (s, e) =>
-            {
-                try
+                if (result == DialogResult.Yes)
                 {
-                    var (updateAvailable, _, _) = await UpdateChecker.CheckForUpdatesAsync(forceShow: false);
-                    hasUpdate = updateAvailable;
+                    UpdateForm updateForm = new(updateRequired, newVersion, updateAvailable: false);
+                    updateForm.ShowDialog();
                 }
-                catch { /* Ignore update check errors */ }
-            };
+            }
+            else
+            {
+                UpdateForm updateForm = new(updateRequired, newVersion, updateAvailable: true);
+                updateForm.ShowDialog();
+            }
         }
 
         private void RefreshMap_Click(object sender, EventArgs e)
-        {
+        { 
             SaveCurrentConfig();
             LogUtil.LogInfo("Sending RefreshMap command to all bots.", "Refresh Map");
             SendAll(BotControlCommand.RefreshMap);
-            btnNavLogs.PerformClick(); // Switch to logs view
+            Tab_Logs.Select();
             if (Bots.Count == 0)
                 WinFormsUtil.Alert("No bots configured, but all supporting services have been issued the refresh map command.");
+
         }
 
         private void SendAll(BotControlCommand cmd)
@@ -464,13 +723,10 @@ namespace SysBot.Pokemon.WinForms
 
         private void AddBotControl(PokeBotState cfg)
         {
-            var row = new BotController { Width = FLP_Bots.Width - 60 };
+            var row = new BotController { Width = FLP_Bots.Width };
             row.Initialize(RunningEnvironment, cfg);
             FLP_Bots.Controls.Add(row);
             FLP_Bots.SetFlowBreak(row, true);
-
-            // Modern dark theme styling is now handled in BotController itself
-
             row.Click += (s, e) =>
             {
                 var details = cfg.Connection;
@@ -504,7 +760,7 @@ namespace SysBot.Pokemon.WinForms
         private void FLP_Bots_Resize(object sender, EventArgs e)
         {
             foreach (var c in FLP_Bots.Controls.OfType<BotController>())
-                c.Width = FLP_Bots.Width - 60; // Account for scrollbar and padding
+                c.Width = FLP_Bots.Width;
         }
 
         private void CB_Protocol_SelectedIndexChanged(object sender, EventArgs e)
@@ -512,68 +768,407 @@ namespace SysBot.Pokemon.WinForms
             TB_IP.Visible = CB_Protocol.SelectedIndex == 0;
         }
 
-        private void ShowFromTray()
+        private void FLP_Bots_Paint(object sender, PaintEventArgs e)
         {
-            Show();
-            WindowState = FormWindowState.Normal;
-            ShowInTaskbar = true;
-            trayIcon.Visible = false;
-            BringToFront();
-            Activate();
-
-            int headerHeight = headerPanel.Height + 10;
-
-            // Adjust padding only if panels haven't been initialized yet (checking Padding.Top as an indicator)
-            if (hubPanel.Padding.Top <= 40)
-                hubPanel.Padding = new Padding(40, headerHeight, 40, 40);
-
-            if (logsPanel.Padding.Top <= 40)
-                logsPanel.Padding = new Padding(40, headerHeight, 40, 40);
-
-            // Force layout recalculation explicitly
-            hubPanel.PerformLayout();
-            PG_Hub.Refresh();
-
-            logsPanel.PerformLayout();
-            RTB_Logs.Refresh();
-
-            // Ensure control buttons are properly positioned
-            HeaderPanel_Resize(headerPanel, EventArgs.Empty);
         }
 
-        private void ExitApplication()
+        private void ComboBox1_SelectedIndexChanged(object sender, EventArgs e)
         {
-            var bots = RunningEnvironment;
-            if (bots != null && bots.IsRunning)
+            if (sender is ComboBox comboBox)
             {
-                var result = MessageBox.Show(
-                    "Bots are currently running. Do you want to stop all bots and exit?",
-                    "Exit Confirmation",
-                    MessageBoxButtons.YesNo,
-                    MessageBoxIcon.Warning);
+                string selectedTheme = comboBox.SelectedItem.ToString();
+                Config.Hub.ThemeOption = selectedTheme;  // Save the selected theme to the config
+                SaveCurrentConfig();  // Save the config to file
 
-                if (result != DialogResult.Yes)
-                    return;
+                switch (selectedTheme)
+                {
+                    case "Light Mode":
+                        ApplyLightTheme();
+                        break;
 
-                bots.StopAll();
+                    case "Dark Mode":
+                        ApplyDarkTheme();
+                        break;
+
+                    case "Poke Mode":
+                        ApplyPokemonTheme();
+                        break;
+
+                    case "Gengar Mode":
+                        ApplyGengarTheme();
+                        break;
+
+                    case "Sylveon Mode":
+                        ApplySylveonTheme();
+                        break;
+
+                    default:
+                        ApplyLightTheme();  // Default to Light Mode if no matching theme is found
+                        break;
+                }
+            }
+        }
+
+        private void ApplySylveonTheme()
+        {
+            // Define Sylveon-theme colors
+            Color SoftPink = Color.FromArgb(255, 182, 193);   // A soft pink color inspired by Sylveon's body
+            Color DeepPink = Color.FromArgb(255, 105, 180);   // A deeper pink for contrast and visual interest
+            Color SkyBlue = Color.FromArgb(135, 206, 250);    // A soft blue color inspired by Sylveon's eyes and ribbons
+            Color DeepBlue = Color.FromArgb(70, 130, 180);   // A deeper blue for contrast
+            Color ElegantWhite = Color.FromArgb(255, 255, 255);// An elegant white for background and contrast
+            Color StartGreen = Color.FromArgb(10, 74, 27);// Start Button
+            Color StopRed = Color.FromArgb(74, 10, 10);// Stop Button
+            Color RebootBlue = Color.FromArgb(10, 35, 74);// Reboot Button
+            Color RefreshMap = Color.FromArgb(245, 245, 220);// Refresh Map Button
+            // Set the background color of the form
+            BackColor = ElegantWhite;
+
+            // Set the foreground color of the form (text color)
+            ForeColor = DeepBlue;
+
+            // Set the background color of the tab control
+            TC_Main.BackColor = SkyBlue;
+
+            // Set the background color of each tab page
+            foreach (TabPage page in TC_Main.TabPages)
+            {
+                page.BackColor = ElegantWhite;
             }
 
-            isExiting = true;
-            trayIcon.Dispose();
-            Application.Exit();
-        }
-    }
+            // Set the background color of the property grid
+            PG_Hub.BackColor = ElegantWhite;
+            PG_Hub.LineColor = SkyBlue;
+            PG_Hub.CategoryForeColor = DeepBlue;
+            PG_Hub.CategorySplitterColor = SkyBlue;
+            PG_Hub.HelpBackColor = SoftPink;
+            PG_Hub.HelpForeColor = DeepBlue;
+            PG_Hub.ViewBackColor = ElegantWhite;
+            PG_Hub.ViewForeColor = DeepBlue;
 
-    // Extension methods for graphics
-    public static class GraphicsExtensions
-    {
-        public static void AddRoundedRectangle(this GraphicsPath path, Rectangle rect, int radius)
+            // Set the background color of the rich text box
+            RTB_Logs.BackColor = SoftPink;
+            RTB_Logs.ForeColor = DeepBlue;
+
+            // Set colors for other controls
+            TB_IP.BackColor = SkyBlue;
+            TB_IP.ForeColor = DeepBlue;
+
+            CB_Routine.BackColor = SkyBlue;
+            CB_Routine.ForeColor = DeepBlue;
+
+            NUD_Port.BackColor = SkyBlue;
+            NUD_Port.ForeColor = DeepBlue;
+
+            B_New.BackColor = DeepPink;
+            B_New.ForeColor = ElegantWhite;
+
+            FLP_Bots.BackColor = ElegantWhite;
+
+            CB_Protocol.BackColor = SkyBlue;
+            CB_Protocol.ForeColor = DeepBlue;
+
+            comboBox1.BackColor = SkyBlue;
+            comboBox1.ForeColor = DeepBlue;
+
+            B_Stop.BackColor = StopRed;
+            B_Stop.ForeColor = ElegantWhite;
+
+            B_Start.BackColor = StartGreen;
+            B_Start.ForeColor = ElegantWhite;
+
+            B_RebootAndStop.BackColor = RebootBlue;
+            B_RebootAndStop.ForeColor = ElegantWhite;
+        }
+
+        private void ApplyGengarTheme()
         {
-            path.AddArc(rect.X, rect.Y, radius * 2, radius * 2, 180, 90);
-            path.AddArc(rect.Right - radius * 2, rect.Y, radius * 2, radius * 2, 270, 90);
-            path.AddArc(rect.Right - radius * 2, rect.Bottom - radius * 2, radius * 2, radius * 2, 0, 90);
-            path.AddArc(rect.X, rect.Bottom - radius * 2, radius * 2, radius * 2, 90, 90);
-            path.CloseFigure();
+            // Define Gengar-theme colors
+            Color GengarPurple = Color.FromArgb(88, 88, 120);  // A muted purple, the main color of Gengar
+            Color DarkShadow = Color.FromArgb(40, 40, 60);     // A deeper shade for shadowing and contrast
+            Color GhostlyGrey = Color.FromArgb(200, 200, 215); // A soft grey for text and borders
+            Color HauntingBlue = Color.FromArgb(80, 80, 160);  // A haunting blue for accenting and highlights
+            Color MidnightBlack = Color.FromArgb(25, 25, 35);  // A near-black for the darkest areas
+            Color ElegantWhite = Color.FromArgb(255, 255, 255);// An elegant white for background and contrast
+            Color StartGreen = Color.FromArgb(10, 74, 27);// Start Button
+            Color StopRed = Color.FromArgb(74, 10, 10);// Stop Button
+            Color RebootBlue = Color.FromArgb(10, 35, 74);// Reboot Button
+            Color RefreshMap = Color.FromArgb(245, 245, 220);// Refresh Map Button
+
+            // Set the background color of the form
+            BackColor = MidnightBlack;
+
+            // Set the foreground color of the form (text color)
+            ForeColor = GhostlyGrey;
+
+            // Set the background color of the tab control
+            TC_Main.BackColor = GengarPurple;
+
+            // Set the background color of each tab page
+            foreach (TabPage page in TC_Main.TabPages)
+            {
+                page.BackColor = DarkShadow;
+            }
+
+            // Set the background color of the property grid
+            PG_Hub.BackColor = DarkShadow;
+            PG_Hub.LineColor = HauntingBlue;
+            PG_Hub.CategoryForeColor = GhostlyGrey;
+            PG_Hub.CategorySplitterColor = HauntingBlue;
+            PG_Hub.HelpBackColor = DarkShadow;
+            PG_Hub.HelpForeColor = GhostlyGrey;
+            PG_Hub.ViewBackColor = DarkShadow;
+            PG_Hub.ViewForeColor = GhostlyGrey;
+
+            // Set the background color of the rich text box
+            RTB_Logs.BackColor = MidnightBlack;
+            RTB_Logs.ForeColor = GhostlyGrey;
+
+            // Set colors for other controls
+            TB_IP.BackColor = GengarPurple;
+            TB_IP.ForeColor = GhostlyGrey;
+
+            CB_Routine.BackColor = GengarPurple;
+            CB_Routine.ForeColor = GhostlyGrey;
+
+            NUD_Port.BackColor = GengarPurple;
+            NUD_Port.ForeColor = GhostlyGrey;
+
+            B_New.BackColor = HauntingBlue;
+            B_New.ForeColor = GhostlyGrey;
+
+            FLP_Bots.BackColor = DarkShadow;
+
+            CB_Protocol.BackColor = GengarPurple;
+            CB_Protocol.ForeColor = GhostlyGrey;
+
+            comboBox1.BackColor = GengarPurple;
+            comboBox1.ForeColor = GhostlyGrey;
+
+            B_Stop.BackColor = StopRed;
+            B_Stop.ForeColor = ElegantWhite;
+
+            B_Start.BackColor = StartGreen;
+            B_Start.ForeColor = ElegantWhite;
+
+            B_RebootAndStop.BackColor = RebootBlue;
+            B_RebootAndStop.ForeColor = ElegantWhite;
+        }
+
+        private void ApplyLightTheme()
+        {
+            // Define the color palette
+            Color SoftBlue = Color.FromArgb(235, 245, 251);
+            Color GentleGrey = Color.FromArgb(245, 245, 245);
+            Color DarkBlue = Color.FromArgb(26, 13, 171);
+            Color ElegantWhite = Color.FromArgb(255, 255, 255);// An elegant white for background and contrast
+            Color StartGreen = Color.FromArgb(10, 74, 27);// Start Button
+            Color StopRed = Color.FromArgb(74, 10, 10);// Stop Button
+            Color RebootBlue = Color.FromArgb(10, 35, 74);// Reboot Button
+            Color RefreshMap = Color.FromArgb(245, 245, 220);// Refresh Map Button
+            // Set the background color of the form
+            BackColor = GentleGrey;
+
+            // Set the foreground color of the form (text color)
+            ForeColor = DarkBlue;
+
+            // Set the background color of the tab control
+            TC_Main.BackColor = SoftBlue;
+
+            // Set the background color of each tab page
+            foreach (TabPage page in TC_Main.TabPages)
+            {
+                page.BackColor = GentleGrey;
+            }
+
+            // Set the background color of the property grid
+            PG_Hub.BackColor = GentleGrey;
+            PG_Hub.LineColor = SoftBlue;
+            PG_Hub.CategoryForeColor = DarkBlue;
+            PG_Hub.CategorySplitterColor = SoftBlue;
+            PG_Hub.HelpBackColor = GentleGrey;
+            PG_Hub.HelpForeColor = DarkBlue;
+            PG_Hub.ViewBackColor = GentleGrey;
+            PG_Hub.ViewForeColor = DarkBlue;
+
+            // Set the background color of the rich text box
+            RTB_Logs.BackColor = Color.White;
+            RTB_Logs.ForeColor = DarkBlue;
+
+            // Set colors for other controls
+            TB_IP.BackColor = Color.White;
+            TB_IP.ForeColor = DarkBlue;
+
+            CB_Routine.BackColor = Color.White;
+            CB_Routine.ForeColor = DarkBlue;
+
+            NUD_Port.BackColor = Color.White;
+            NUD_Port.ForeColor = DarkBlue;
+
+            B_New.BackColor = SoftBlue;
+            B_New.ForeColor = DarkBlue;
+
+            FLP_Bots.BackColor = GentleGrey;
+
+            CB_Protocol.BackColor = Color.White;
+            CB_Protocol.ForeColor = DarkBlue;
+
+            comboBox1.BackColor = Color.White;
+            comboBox1.ForeColor = DarkBlue;
+
+            B_Stop.BackColor = StopRed;
+            B_Stop.ForeColor = ElegantWhite;
+
+            B_Start.BackColor = StartGreen;
+            B_Start.ForeColor = ElegantWhite;
+
+            B_RebootAndStop.BackColor = RebootBlue;
+            B_RebootAndStop.ForeColor = ElegantWhite;
+        }
+
+        private void ApplyPokemonTheme()
+        {
+            // Define Poke-theme colors
+            Color PokeRed = Color.FromArgb(206, 12, 30);      // A classic red tone reminiscent of the Pokeball
+            Color DarkPokeRed = Color.FromArgb(164, 10, 24);  // A darker shade of the PokeRed for contrast and depth
+            Color SleekGrey = Color.FromArgb(46, 49, 54);     // A sleek grey for background and contrast
+            Color SoftWhite = Color.FromArgb(230, 230, 230);  // A soft white for text and borders
+            Color MidnightBlack = Color.FromArgb(18, 19, 20); // A near-black for darker elements and depth
+            Color ElegantWhite = Color.FromArgb(255, 255, 255);// An elegant white for background and contrast
+            Color StartGreen = Color.FromArgb(10, 74, 27);// Start Button
+            Color StopRed = Color.FromArgb(74, 10, 10);// Stop Button
+            Color RebootBlue = Color.FromArgb(10, 35, 74);// Reboot Button
+            Color RefreshMap = Color.FromArgb(245, 245, 220);// Refresh Map Button
+            // Set the background color of the form
+            BackColor = SleekGrey;
+
+            // Set the foreground color of the form (text color)
+            ForeColor = SoftWhite;
+
+            // Set the background color of the tab control
+            TC_Main.BackColor = DarkPokeRed;
+
+            // Set the background color of each tab page
+            foreach (TabPage page in TC_Main.TabPages)
+            {
+                page.BackColor = SleekGrey;
+            }
+
+            // Set the background color of the property grid
+            PG_Hub.BackColor = SleekGrey;
+            PG_Hub.LineColor = DarkPokeRed;
+            PG_Hub.CategoryForeColor = SoftWhite;
+            PG_Hub.CategorySplitterColor = DarkPokeRed;
+            PG_Hub.HelpBackColor = SleekGrey;
+            PG_Hub.HelpForeColor = SoftWhite;
+            PG_Hub.ViewBackColor = SleekGrey;
+            PG_Hub.ViewForeColor = SoftWhite;
+
+            // Set the background color of the rich text box
+            RTB_Logs.BackColor = MidnightBlack;
+            RTB_Logs.ForeColor = SoftWhite;
+
+            // Set colors for other controls
+            TB_IP.BackColor = DarkPokeRed;
+            TB_IP.ForeColor = SoftWhite;
+
+            CB_Routine.BackColor = DarkPokeRed;
+            CB_Routine.ForeColor = SoftWhite;
+
+            NUD_Port.BackColor = DarkPokeRed;
+            NUD_Port.ForeColor = SoftWhite;
+
+            B_New.BackColor = PokeRed;
+            B_New.ForeColor = SoftWhite;
+
+            FLP_Bots.BackColor = SleekGrey;
+
+            CB_Protocol.BackColor = DarkPokeRed;
+            CB_Protocol.ForeColor = SoftWhite;
+
+            comboBox1.BackColor = DarkPokeRed;
+            comboBox1.ForeColor = SoftWhite;
+
+            B_Stop.BackColor = StopRed;
+            B_Stop.ForeColor = ElegantWhite;
+
+            B_Start.BackColor = StartGreen;
+            B_Start.ForeColor = ElegantWhite;
+
+            B_RebootAndStop.BackColor = RebootBlue;
+            B_RebootAndStop.ForeColor = ElegantWhite;
+        }
+
+        private void ApplyDarkTheme()
+        {
+            // Define the dark theme colors
+            Color DarkRed = Color.FromArgb(90, 0, 0);
+            Color DarkGrey = Color.FromArgb(30, 30, 30);
+            Color LightGrey = Color.FromArgb(60, 60, 60);
+            Color SoftWhite = Color.FromArgb(245, 245, 245);
+            Color ElegantWhite = Color.FromArgb(255, 255, 255);// An elegant white for background and contrast
+            Color StartGreen = Color.FromArgb(10, 74, 27);// Start Button
+            Color StopRed = Color.FromArgb(74, 10, 10);// Stop Button
+            Color RebootBlue = Color.FromArgb(10, 35, 74);// Reboot Button
+            Color RefreshMap = Color.FromArgb(245, 245, 220);// Refresh Map Button
+            // Set the background color of the form
+            BackColor = DarkGrey;
+
+            // Set the foreground color of the form (text color)
+            ForeColor = SoftWhite;
+
+            // Set the background color of the tab control
+            TC_Main.BackColor = LightGrey;
+
+            // Set the background color of each tab page
+            foreach (TabPage page in TC_Main.TabPages)
+            {
+                page.BackColor = DarkGrey;
+            }
+
+            // Set the background color of the property grid
+            PG_Hub.BackColor = DarkGrey;
+            PG_Hub.LineColor = LightGrey;
+            PG_Hub.CategoryForeColor = SoftWhite;
+            PG_Hub.CategorySplitterColor = LightGrey;
+            PG_Hub.HelpBackColor = DarkGrey;
+            PG_Hub.HelpForeColor = SoftWhite;
+            PG_Hub.ViewBackColor = DarkGrey;
+            PG_Hub.ViewForeColor = SoftWhite;
+
+            // Set the background color of the rich text box
+            RTB_Logs.BackColor = DarkGrey;
+            RTB_Logs.ForeColor = SoftWhite;
+
+            // Set colors for other controls
+            TB_IP.BackColor = LightGrey;
+            TB_IP.ForeColor = SoftWhite;
+
+            CB_Routine.BackColor = LightGrey;
+            CB_Routine.ForeColor = SoftWhite;
+
+            NUD_Port.BackColor = LightGrey;
+            NUD_Port.ForeColor = SoftWhite;
+
+            B_New.BackColor = DarkRed;
+            B_New.ForeColor = SoftWhite;
+
+            FLP_Bots.BackColor = DarkGrey;
+
+            CB_Protocol.BackColor = LightGrey;
+            CB_Protocol.ForeColor = SoftWhite;
+
+            comboBox1.BackColor = LightGrey;
+            comboBox1.ForeColor = SoftWhite;
+
+            B_Stop.BackColor = StopRed;
+            B_Stop.ForeColor = ElegantWhite;
+
+            B_Start.BackColor = StartGreen;
+            B_Start.ForeColor = ElegantWhite;
+
+            B_RebootAndStop.BackColor = RebootBlue;
+            B_RebootAndStop.ForeColor = ElegantWhite;
         }
     }
 }
