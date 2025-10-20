@@ -677,6 +677,7 @@ namespace SysBot.Pokemon.SV.BotRaid
                             }
                         }
 
+                        Ensure_currentRaidIndexInBounds();
                         Log($"Preparing parameter for {_settings.ActiveRaids[_currentRaidIndex].Species}");
 
                         try
@@ -771,6 +772,7 @@ namespace SysBot.Pokemon.SV.BotRaid
                             continue;
                         }
 
+                        Ensure_currentRaidIndexInBounds();
                         if (_settings.ActiveRaids[_currentRaidIndex].AddedByRACommand)
                         {
                             try
